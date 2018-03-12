@@ -116,7 +116,7 @@ public class BulkMutateRowsRetryTest {
     ApiFuture<Void> result = bulkMutations.add(RowMutation.create(TABLE_ID, "key1"));
     verifyOk(result);
 
-    assertThat(service.expectations).isEmpty();
+    service.verifyOk();
   }
 
   @Test
@@ -130,7 +130,7 @@ public class BulkMutateRowsRetryTest {
     verifyOk(result1);
     verifyOk(result2);
 
-    assertThat(service.expectations).isEmpty();
+    service.verifyOk();
   }
 
   @Test
@@ -141,7 +141,7 @@ public class BulkMutateRowsRetryTest {
     ApiFuture<Void> result = bulkMutations.add(RowMutation.create(TABLE_ID, "key1"));
     verifyOk(result);
 
-    assertThat(service.expectations).isEmpty();
+    service.verifyOk();
   }
 
   @Test
@@ -155,7 +155,7 @@ public class BulkMutateRowsRetryTest {
     verifyOk(result1);
     verifyOk(result2);
 
-    assertThat(service.expectations).isEmpty();
+    service.verifyOk();
   }
 
   @Test
@@ -169,7 +169,7 @@ public class BulkMutateRowsRetryTest {
     verifyError(result1, StatusCode.Code.INVALID_ARGUMENT);
     verifyOk(result2);
 
-    assertThat(service.expectations).isEmpty();
+    service.verifyOk();
   }
 
   @Test
@@ -184,7 +184,7 @@ public class BulkMutateRowsRetryTest {
     ApiFuture<Void> result1 = bulkMutations.add(RowMutation.create(TABLE_ID, "key1"));
     verifyError(result1, StatusCode.Code.DEADLINE_EXCEEDED);
 
-    assertThat(service.expectations).isEmpty();
+    service.verifyOk();
   }
 
   @Test
@@ -209,7 +209,7 @@ public class BulkMutateRowsRetryTest {
     }
 
     verifyOk(ApiFutures.allAsList(results));
-    assertThat(service.expectations).isEmpty();
+    service.verifyOk();
   }
 
   private void verifyOk(ApiFuture<?> result) {
@@ -267,9 +267,25 @@ public class BulkMutateRowsRetryTest {
 
   static class TestBigtableService extends BigtableGrpc.BigtableImplBase {
     Queue<RpcExpectation> expectations = Queues.newArrayDeque();
+    private List<Throwable> errors = Lists.newArrayList();
+
+    void verifyOk() {
+      assertThat(expectations).isEmpty();
+      assertThat(errors).isEmpty();
+    }
 
     @Override
-    public void mutateRows(
+    public void mutateRows(MutateRowsRequest request, StreamObserver<MutateRowsResponse> responseObserver) {
+      System.out.println("called with: " + request);
+      try {
+        mutateRowsUnsafe(request, responseObserver);
+      } catch (Throwable t) {
+        errors.add(t);
+        throw t;
+      }
+    }
+
+    public void mutateRowsUnsafe(
         MutateRowsRequest request, StreamObserver<MutateRowsResponse> responseObserver) {
       RpcExpectation expectedRpc = expectations.poll();
 

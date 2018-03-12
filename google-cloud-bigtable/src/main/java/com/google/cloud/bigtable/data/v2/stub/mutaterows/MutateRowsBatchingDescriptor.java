@@ -18,23 +18,18 @@ package com.google.cloud.bigtable.data.v2.stub.mutaterows;
 import com.google.api.core.InternalApi;
 import com.google.api.gax.batching.PartitionKey;
 import com.google.api.gax.batching.RequestBuilder;
-import com.google.api.gax.grpc.GrpcStatusCode;
 import com.google.api.gax.rpc.ApiException;
-import com.google.api.gax.rpc.ApiExceptionFactory;
 import com.google.api.gax.rpc.BatchedRequestIssuer;
 import com.google.api.gax.rpc.BatchingDescriptor;
-import com.google.api.gax.rpc.StatusCode;
 import com.google.bigtable.v2.MutateRowsRequest;
-import com.google.bigtable.v2.MutateRowsResponse;
-import com.google.common.base.Preconditions;
-import com.google.common.collect.ImmutableSet;
-import com.google.common.primitives.Ints;
-import com.google.rpc.Code;
-import com.google.rpc.Status;
-import io.grpc.StatusException;
-import io.grpc.StatusRuntimeException;
+import com.google.cloud.bigtable.data.v2.models.MutateRowsException;
+import com.google.cloud.bigtable.data.v2.models.MutateRowsException.FailedMutation;
+import com.google.common.base.Function;
+import com.google.common.collect.Maps;
 import java.util.Collection;
-import java.util.Set;
+import java.util.List;
+import java.util.Map;
+import javax.annotation.Nullable;
 
 /**
  * A custom implementation of a {@link BatchingDescriptor} to split individual results of a bulk
@@ -47,22 +42,7 @@ import java.util.Set;
  */
 @InternalApi
 public class MutateRowsBatchingDescriptor
-    implements BatchingDescriptor<MutateRowsRequest, MutateRowsResponse> {
-
-  // Shared response to notify individual issuers of a successful mutation.
-  private static final MutateRowsResponse OK_RESPONSE =
-      MutateRowsResponse.newBuilder()
-          .addEntries(
-              MutateRowsResponse.Entry.newBuilder()
-                  .setIndex(0)
-                  .setStatus(Status.newBuilder().setCode(Code.OK_VALUE)))
-          .build();
-
-  private final ImmutableSet<StatusCode.Code> retryableCodes;
-
-  public MutateRowsBatchingDescriptor(Set<StatusCode.Code> retryableCodes) {
-    this.retryableCodes = ImmutableSet.copyOf(retryableCodes);
-  }
+    implements BatchingDescriptor<MutateRowsRequest, Void> {
 
   /** Return the target table name. This will be used to combine batcheable requests */
   @Override
@@ -76,46 +56,50 @@ public class MutateRowsBatchingDescriptor
     return new MyRequestBuilder();
   }
 
-  /** {@inheritDoc} */
   @Override
-  public void splitResponse(
-      MutateRowsResponse batchResponse,
-      Collection<? extends BatchedRequestIssuer<MutateRowsResponse>> batch) {
+  public void splitResponse(Void batchResponse,
+      Collection<? extends BatchedRequestIssuer<Void>> batch) {
 
-    // Sort the result entries by index.
-    Status[] sortedEntries = new Status[batchResponse.getEntriesCount()];
+    for (BatchedRequestIssuer<Void> issuer : batch) {
+      issuer.setResponse(null);
+    }
+  }
 
-    for (MutateRowsResponse.Entry entry : batchResponse.getEntriesList()) {
-      int index = Ints.checkedCast(entry.getIndex());
-      Preconditions.checkState(
-          sortedEntries[index] == null, "Got multiple results for the same sub-mutation");
-      sortedEntries[index] = entry.getStatus();
+  @Override
+  public void splitException(Throwable throwable,
+      Collection<? extends BatchedRequestIssuer<Void>> batch) {
+
+    if (!(throwable instanceof MutateRowsException)) {
+      for (BatchedRequestIssuer<Void> issuer : batch) {
+        issuer.setException(throwable);
+      }
+      return;
     }
 
-    // Notify all of issuers of the corresponding result.
-    int i = 0;
-    for (BatchedRequestIssuer<MutateRowsResponse> issuer : batch) {
-      Status entry = sortedEntries[i++];
-      Preconditions.checkState(entry != null, "Missing result for entry");
+    List<FailedMutation> failedMutations = ((MutateRowsException)throwable).getFailedMutations();
 
-      if (entry.getCode() == Code.OK_VALUE) {
-        issuer.setResponse(OK_RESPONSE);
-      } else {
-        issuer.setException(createElementException(entry));
+    Map<Integer, FailedMutation> errorsByIndex = Maps.uniqueIndex(failedMutations,
+        new Function<FailedMutation, Integer>() {
+          @Nullable
+          @Override
+          public Integer apply(@Nullable FailedMutation input) {
+            return input.getIndex();
+          }
+        });
+
+    int i = 0;
+    for (BatchedRequestIssuer<Void> issuer : batch) {
+      for (int j = 0; j < issuer.getMessageCount(); j++) {
+        FailedMutation failure = errorsByIndex.get(i++);
+        if (failure == null) {
+          issuer.setResponse(null);
+        } else {
+          issuer.setException(failure.getError());
+        }
       }
     }
   }
 
-  /** {@inheritDoc} */
-  @Override
-  public void splitException(
-      Throwable throwable, Collection<? extends BatchedRequestIssuer<MutateRowsResponse>> batch) {
-    throwable = createElementException(throwable);
-
-    for (BatchedRequestIssuer<MutateRowsResponse> responder : batch) {
-      responder.setException(throwable);
-    }
-  }
 
   /** {@inheritDoc} */
   @Override
@@ -127,38 +111,6 @@ public class MutateRowsBatchingDescriptor
   @Override
   public long countBytes(MutateRowsRequest request) {
     return request.getSerializedSize();
-  }
-
-  /** Convert an element error Status into an ApiException */
-  private ApiException createElementException(Status protoStatus) {
-    Preconditions.checkArgument(protoStatus.getCode() != Code.OK_VALUE, "OK is not an error");
-
-    StatusRuntimeException throwable =
-        io.grpc.Status.fromCodeValue(protoStatus.getCode())
-            .withDescription(protoStatus.getMessage())
-            .asRuntimeException();
-
-    return createElementException(throwable);
-  }
-
-  /** Convert a Throwable into an ApiException, marking it as retryable when appropriate. */
-  private ApiException createElementException(Throwable throwable) {
-    final io.grpc.Status.Code code;
-
-    if (throwable instanceof ApiException) {
-      return (ApiException) throwable;
-    } else if (throwable instanceof StatusRuntimeException) {
-      code = ((StatusRuntimeException) throwable).getStatus().getCode();
-    } else if (throwable instanceof StatusException) {
-      code = ((StatusException) throwable).getStatus().getCode();
-    } else {
-      code = io.grpc.Status.Code.UNKNOWN;
-    }
-
-    GrpcStatusCode gaxStatusCode = GrpcStatusCode.of(code);
-    boolean isRetryable = retryableCodes.contains(gaxStatusCode.getCode());
-
-    return ApiExceptionFactory.createException(throwable, gaxStatusCode, isRetryable);
   }
 
   /** A {@link com.google.api.gax.batching.RequestBuilder} that can aggregate MutateRowsRequest */

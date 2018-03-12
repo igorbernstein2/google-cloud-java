@@ -15,10 +15,11 @@
  */
 package com.google.cloud.bigtable.data.v2.stub;
 
-import com.google.api.core.ApiFuture;
 import com.google.api.core.InternalApi;
-import com.google.api.gax.retrying.RetrySettings;
-import com.google.api.gax.rpc.ApiCallContext;
+import com.google.api.gax.retrying.ExponentialRetryAlgorithm;
+import com.google.api.gax.retrying.RetryAlgorithm;
+import com.google.api.gax.retrying.RetryingExecutor;
+import com.google.api.gax.retrying.ScheduledRetryingExecutor;
 import com.google.api.gax.rpc.BatchingCallSettings;
 import com.google.api.gax.rpc.Callables;
 import com.google.api.gax.rpc.ClientContext;
@@ -26,7 +27,6 @@ import com.google.api.gax.rpc.ServerStreamingCallSettings;
 import com.google.api.gax.rpc.ServerStreamingCallable;
 import com.google.api.gax.rpc.UnaryCallable;
 import com.google.bigtable.v2.MutateRowsRequest;
-import com.google.bigtable.v2.MutateRowsResponse;
 import com.google.bigtable.v2.ReadRowsRequest;
 import com.google.bigtable.v2.SampleRowKeysRequest;
 import com.google.bigtable.v2.SampleRowKeysResponse;
@@ -40,13 +40,14 @@ import com.google.cloud.bigtable.data.v2.models.Row;
 import com.google.cloud.bigtable.data.v2.models.RowAdapter;
 import com.google.cloud.bigtable.data.v2.models.RowMutation;
 import com.google.cloud.bigtable.data.v2.stub.mutaterows.MutateRowsBatchingDescriptor;
-import com.google.cloud.bigtable.data.v2.stub.mutaterows.MutateRowsSpoolingCallable;
+import com.google.cloud.bigtable.data.v2.stub.mutaterows.MutateRowsRetryingCallable;
 import com.google.cloud.bigtable.data.v2.stub.mutaterows.MutateRowsUserFacingCallable;
 import com.google.cloud.bigtable.data.v2.stub.readrows.FilterMarkerRowsCallable;
 import com.google.cloud.bigtable.data.v2.stub.readrows.ReadRowsResumptionStrategy;
 import com.google.cloud.bigtable.data.v2.stub.readrows.ReadRowsRetryCompletedCallable;
 import com.google.cloud.bigtable.data.v2.stub.readrows.ReadRowsUserCallable;
 import com.google.cloud.bigtable.data.v2.stub.readrows.RowMergingCallable;
+import com.google.cloud.bigtable.gaxx.retrying.ApiResultRetryAlgorithm;
 import java.io.IOException;
 import java.util.List;
 import org.threeten.bp.Duration;
@@ -255,22 +256,28 @@ public class EnhancedBigtableStub implements AutoCloseable {
    * </ul>
    */
   private UnaryCallable<RowMutation, Void> createMutateRowsCallable() {
-    MutateRowsSpoolingCallable spooling = new MutateRowsSpoolingCallable(stub.mutateRowsCallable());
+    RetryAlgorithm<Void> retryAlgorithm =
+        new RetryAlgorithm<>(
+            new ApiResultRetryAlgorithm(),
+            new ExponentialRetryAlgorithm(
+                settings.mutateRowsSettings().getRetrySettings(), clientContext.getClock()));
+    RetryingExecutor<Void> retryingExecutor =
+        new ScheduledRetryingExecutor<>(retryAlgorithm, clientContext.getExecutor());
+
+    UnaryCallable<MutateRowsRequest, Void> retrying = new MutateRowsRetryingCallable(
+        clientContext.getDefaultCallContext(), stub.mutateRowsCallable(), retryingExecutor,
+        settings.mutateRowsSettings().getRetryableCodes());
 
     // recreate BatchingCallSettings with the correct descriptor
-    BatchingCallSettings.Builder<MutateRowsRequest, MutateRowsResponse> batchingCallSettings =
-        BatchingCallSettings.newBuilder(
-                new MutateRowsBatchingDescriptor(settings.mutateRowsSettings().getRetryableCodes()))
+    BatchingCallSettings.Builder<MutateRowsRequest, Void> batchingCallSettings =
+        BatchingCallSettings.newBuilder(new MutateRowsBatchingDescriptor())
             .setBatchingSettings(settings.mutateRowsSettings().getBatchingSettings());
 
-    UnaryCallable<MutateRowsRequest, MutateRowsResponse> batching =
-        Callables.batching(spooling, batchingCallSettings.build(), clientContext);
-
-    UnaryCallable<MutateRowsRequest, MutateRowsResponse> retrying =
-        Callables.retrying(batching, settings.mutateRowsSettings(), clientContext);
+    UnaryCallable<MutateRowsRequest, Void> batching =
+        Callables.batching(retrying, batchingCallSettings.build(), clientContext);
 
     MutateRowsUserFacingCallable userFacing =
-        new MutateRowsUserFacingCallable(retrying, requestContext);
+        new MutateRowsUserFacingCallable(batching, requestContext);
 
     return userFacing.withDefaultCallContext(clientContext.getDefaultCallContext());
   }
