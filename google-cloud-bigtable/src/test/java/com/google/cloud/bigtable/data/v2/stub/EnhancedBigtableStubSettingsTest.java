@@ -132,29 +132,22 @@ public class EnhancedBigtableStubSettingsTest {
 
     builder
         .readRowsSettings()
-        .setTimeoutCheckInterval(Duration.ofSeconds(10))
         .setIdleTimeout(Duration.ofMinutes(5))
         .setRetryableCodes(Code.ABORTED, Code.DEADLINE_EXCEEDED)
         .setRetrySettings(retrySettings)
         .build();
 
-    assertThat(builder.readRowsSettings().getTimeoutCheckInterval())
-        .isEqualTo(Duration.ofSeconds(10));
     assertThat(builder.readRowsSettings().getIdleTimeout()).isEqualTo(Duration.ofMinutes(5));
     assertThat(builder.readRowsSettings().getRetryableCodes())
         .containsAllOf(Code.ABORTED, Code.DEADLINE_EXCEEDED);
     assertThat(builder.readRowsSettings().getRetrySettings()).isEqualTo(retrySettings);
 
-    assertThat(builder.build().readRowsSettings().getTimeoutCheckInterval())
-        .isEqualTo(Duration.ofSeconds(10));
     assertThat(builder.build().readRowsSettings().getIdleTimeout())
         .isEqualTo(Duration.ofMinutes(5));
     assertThat(builder.build().readRowsSettings().getRetryableCodes())
         .containsAllOf(Code.ABORTED, Code.DEADLINE_EXCEEDED);
     assertThat(builder.build().readRowsSettings().getRetrySettings()).isEqualTo(retrySettings);
 
-    assertThat(builder.build().toBuilder().readRowsSettings().getTimeoutCheckInterval())
-        .isEqualTo(Duration.ofSeconds(10));
     assertThat(builder.build().toBuilder().readRowsSettings().getIdleTimeout())
         .isEqualTo(Duration.ofMinutes(5));
     assertThat(builder.build().toBuilder().readRowsSettings().getRetryableCodes())

@@ -169,9 +169,9 @@
     <testing.version>0.38.1-alpha-SNAPSHOT</testing.version><!-- {x-version-update:google-cloud-testing:current} -->
     
     <api-common.version>1.4.0</api-common.version>
-    <gax.version>1.19.0</gax.version>
-    <gax-grpc.version>1.19.0</gax-grpc.version>
-    <gax-httpjson.version>0.36.0</gax-httpjson.version>
+    <gax.version>1.19.1-SNAPSHOT</gax.version>
+    <gax-grpc.version>1.19.1-SNAPSHOT</gax-grpc.version>
+    <gax-httpjson.version>0.36.1-SNAPSHOT</gax-httpjson.version>
     <generated-proto-beta.version>0.3.0</generated-proto-beta.version>
     <generated-proto-ga.version>1.2.0</generated-proto-ga.version>
   </properties>

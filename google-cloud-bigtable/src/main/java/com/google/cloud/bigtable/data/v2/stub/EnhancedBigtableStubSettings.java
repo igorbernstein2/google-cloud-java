@@ -208,7 +208,6 @@ public class EnhancedBigtableStubSettings extends StubSettings<EnhancedBigtableS
       readRowsSettings
           .setRetryableCodes(DEFAULT_RETRY_CODES)
           .setRetrySettings(DEFAULT_RETRY_SETTINGS)
-          .setTimeoutCheckInterval(Duration.ofSeconds(10))
           .setIdleTimeout(Duration.ofMinutes(5));
 
       sampleRowKeysSettings = UnaryCallSettings.newUnaryCallSettingsBuilder();
