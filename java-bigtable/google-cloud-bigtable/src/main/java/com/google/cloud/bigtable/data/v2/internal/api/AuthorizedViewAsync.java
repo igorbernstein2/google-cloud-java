@@ -33,6 +33,7 @@ import io.grpc.CallOptions;
 import io.grpc.Deadline;
 import java.io.Closeable;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executor;
 
 public class AuthorizedViewAsync implements AutoCloseable, Closeable {
 
@@ -48,7 +49,8 @@ public class AuthorizedViewAsync implements AutoCloseable, Closeable {
       String viewId,
       Permission permission,
       Metrics metrics,
-      BigtableTimer timer) {
+      BigtableTimer timer,
+      Executor userCallbackExecutor) {
 
     AuthorizedViewName viewName =
         AuthorizedViewName.builder()
@@ -78,7 +80,8 @@ public class AuthorizedViewAsync implements AutoCloseable, Closeable {
             callOptions,
             viewName.toString(),
             metrics,
-            timer);
+            timer,
+            userCallbackExecutor);
 
     return new AuthorizedViewAsync(base);
   }

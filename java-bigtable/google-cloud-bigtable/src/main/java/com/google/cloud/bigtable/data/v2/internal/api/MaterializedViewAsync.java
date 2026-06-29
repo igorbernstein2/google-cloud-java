@@ -30,6 +30,7 @@ import io.grpc.CallOptions;
 import io.grpc.Deadline;
 import java.io.Closeable;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executor;
 
 public class MaterializedViewAsync implements AutoCloseable, Closeable {
 
@@ -44,7 +45,8 @@ public class MaterializedViewAsync implements AutoCloseable, Closeable {
       String viewId,
       OpenMaterializedViewRequest.Permission permission,
       Metrics metrics,
-      BigtableTimer timer) {
+      BigtableTimer timer,
+      Executor userCallbackExecutor) {
 
     MaterializedViewName viewName =
         MaterializedViewName.builder()
@@ -73,7 +75,8 @@ public class MaterializedViewAsync implements AutoCloseable, Closeable {
             callOptions,
             viewId,
             metrics,
-            timer);
+            timer,
+            userCallbackExecutor);
 
     return new MaterializedViewAsync(base);
   }
