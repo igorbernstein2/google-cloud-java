@@ -79,15 +79,18 @@ import java.time.Instant;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.function.LongPredicate;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Answers;
 import org.mockito.ArgumentCaptor;
@@ -95,6 +98,7 @@ import org.mockito.Mock;
 import org.mockito.Mockito;
 import org.mockito.junit.jupiter.MockitoExtension;
 
+@Timeout(30)
 @Nested
 @ExtendWith(MockitoExtension.class)
 public class SessionPoolImplTest {
@@ -277,6 +281,48 @@ public class SessionPoolImplTest {
   }
 
   @Test
+  void pendingVRpcOnClosedPoolDoesNotLeakDeadlineMonitor() throws InterruptedException {
+    // Regression: PendingVRpc.start used to arm the deadline timer before the pool-state
+    // check, so the fast-fail "pool closed" branch leaked an armed timer that fired later
+    // and called listener.onClose a second time with DEADLINE_EXCEEDED.
+    sessionPool.close(
+        CloseSessionRequest.newBuilder()
+            .setReason(CloseSessionRequest.CloseSessionReason.CLOSE_SESSION_REASON_USER)
+            .setDescription("close before issuing rpc")
+            .build());
+
+    CopyOnWriteArrayList<VRpcResult> closes = new CopyOnWriteArrayList<>();
+    CountDownLatch firstClose = new CountDownLatch(1);
+    Duration deadline = Duration.ofMillis(100);
+
+    VRpc<SessionFakeScriptedRequest, SessionFakeScriptedResponse> vrpc =
+        sessionPool.newCall(FakeDescriptor.SCRIPTED);
+    vrpc.start(
+        SessionFakeScriptedRequest.getDefaultInstance(),
+        VRpcCallContext.create(
+            Deadline.after(deadline.toMillis(), TimeUnit.MILLISECONDS), true, vrpcTracer),
+        new VRpc.VRpcListener<SessionFakeScriptedResponse>() {
+          @Override
+          public void onMessage(SessionFakeScriptedResponse msg) {}
+
+          @Override
+          public void onClose(VRpcResult result) {
+            closes.add(result);
+            firstClose.countDown();
+          }
+        });
+
+    // The fast-fail UNAVAILABLE onClose should arrive immediately.
+    assertThat(firstClose.await(1, TimeUnit.SECONDS)).isTrue();
+    assertThat(closes).hasSize(1);
+
+    // Wait past the deadline. With the bug (leaked deadlineMonitor), a phantom
+    // onClose(DEADLINE_EXCEEDED) would arrive in this window. With the fix, no second close.
+    Thread.sleep(deadline.toMillis() * 5);
+    assertThat(closes).hasSize(1);
+  }
+
+  @Test
   void testCreateSessionDoesntPropagateDeadline() {
     DeadlineInterceptor deadlineInterceptor = new DeadlineInterceptor();
     try (ChannelPool capturedDeadlinePool =
@@ -381,10 +427,9 @@ public class SessionPoolImplTest {
       // retry-create-session site computes its delay against the real wall clock and the fake
       // budget clock, so it can land anywhere from sub-second to a couple of penalty intervals.
       // Match anything that isn't one of the two fixed cadences.
-      long watchdogMs = java.time.Duration.ofMinutes(5).toMillis();
+      long watchdogMs = Duration.ofMinutes(5).toMillis();
       long afePruneMs = SessionList.SESSION_LIST_PRUNE_INTERVAL.toMillis();
-      java.util.function.LongPredicate isRetrySchedule =
-          d -> d > 0 && d != watchdogMs && d != afePruneMs;
+      LongPredicate isRetrySchedule = d -> d > 0 && d != watchdogMs && d != afePruneMs;
 
       // start the pool
       sessionPool.start(
