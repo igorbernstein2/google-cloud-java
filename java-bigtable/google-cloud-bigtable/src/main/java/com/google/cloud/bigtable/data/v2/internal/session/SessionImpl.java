@@ -49,6 +49,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.Locale;
 import java.util.Optional;
+import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import javax.annotation.Nullable;
@@ -70,6 +71,12 @@ public class SessionImpl implements Session, VRpcSessionApi {
   // A time in the future to skip heartbeat checks when there's no active vRPCs on the session
   static final Duration FUTURE_TIME = Duration.ofMinutes(30);
 
+  private static final CloseSessionRequest MISSED_HEARTBEAT_CLOSE_REQUEST =
+      CloseSessionRequest.newBuilder()
+          .setReason(CloseSessionReason.CLOSE_SESSION_REASON_MISSED_HEARTBEAT)
+          .setDescription("missed heartbeat")
+          .build();
+
   /*
    * This lock should be mostly uncontended - all access should be naturally interleaved. Contention
    * can only really happen when an unsolicited gRPC control message (ie GOAWAY) arrives at the same
@@ -79,6 +86,7 @@ public class SessionImpl implements Session, VRpcSessionApi {
   private final Object lock = new Object();
 
   private final Clock clock;
+  private final BigtableTimer timer;
 
   private final SessionTracer tracer;
   private final DebugTagTracer debugTagTracer;
@@ -94,12 +102,24 @@ public class SessionImpl implements Session, VRpcSessionApi {
   @GuardedBy("lock")
   private Instant lastStateChangedAt;
 
+  // Set once under lock in start(), then read freely from gRPC callbacks without the lock.
+  // Safe because start() is always called before any callback fires, so the write is
+  // visible to all subsequent readers through the happens-before chain from stream.start().
   private Listener sessionListener;
 
+  // volatile: written under lock in handleSessionRefreshConfigResponse(); read without lock in
+  // getOpenParams() and isOpenParamsUpdated() so callers get a consistent (if possibly stale)
+  // snapshot without contending on the lock. Stale reads are acceptable for these accessors.
   private volatile OpenParams openParams;
 
   private volatile boolean openParamsUpdated;
 
+  // closeReason is written under lock in close(), forceClose(), handleGoAwayResponse(), and
+  // dispatchStreamClosed(). The one read that occurs outside the lock — in dispatchStreamClosed
+  // after the synchronized block — runs on the same gRPC callback thread that just released the
+  // lock, so the lock's release-acquire edge provides the necessary visibility. A stale read is
+  // structurally impossible given the control flow (closeReason is always set before the lock
+  // is released on every path that reaches that read site).
   @Nullable private CloseSessionRequest closeReason = null;
 
   @GuardedBy("lock")
@@ -112,15 +132,34 @@ public class SessionImpl implements Session, VRpcSessionApi {
   @GuardedBy("lock")
   private VRpcResult currentCancel = null;
 
+  @GuardedBy("lock")
   private SessionParametersResponse sessionParameters = DEFAULT_SESSION_PARAMS;
+
+  // volatile: written under lock in handleSessionParamsResponse(); read without lock in
+  // handleHeartBeatResponse() where a stale read is acceptable — the heartbeat deadline is a
+  // soft scheduling hint, not a correctness invariant. startRpc() reads this inside the lock.
   private volatile Duration heartbeatInterval =
       Duration.ofMillis(Durations.toMillis(sessionParameters.getKeepAlive()));
 
+  // volatile: written from multiple sites without holding the lock (startRpc, handleVRpc*,
+  // handleHeartBeatResponse). Stale reads are acceptable — nextHeartbeat is used only as a
+  // scheduling hint by the per-session heartbeat tick.
   private volatile Instant nextHeartbeat;
 
+  // Handle for the in-flight heartbeat tick (one outstanding at a time). Set under lock when the
+  // session enters READY (handleOpenSessionResponse) and again from checkHeartbeat to chain the
+  // next tick. Cancelled under lock from updateState when the session transitions past READY.
+  @GuardedBy("lock")
+  @Nullable
+  private BigtableTimer.Timeout heartbeatTimeout;
+
   public SessionImpl(
-      Metrics metrics, SessionPoolInfo poolInfo, long sessionNum, SessionStream stream) {
-    this(metrics, Clock.systemUTC(), poolInfo, sessionNum, stream);
+      Metrics metrics,
+      SessionPoolInfo poolInfo,
+      long sessionNum,
+      SessionStream stream,
+      BigtableTimer timer) {
+    this(metrics, Clock.systemUTC(), poolInfo, sessionNum, stream, timer);
   }
 
   SessionImpl(
@@ -128,8 +167,10 @@ public class SessionImpl implements Session, VRpcSessionApi {
       Clock clock,
       SessionPoolInfo poolInfo,
       long sessionNum,
-      SessionStream stream) {
+      SessionStream stream,
+      BigtableTimer timer) {
     this.clock = clock;
+    this.timer = timer;
     this.info = SessionInfo.create(poolInfo, sessionNum);
     this.stream = stream;
     this.tracer = metrics.newSessionTracer(poolInfo);
@@ -330,9 +371,6 @@ public class SessionImpl implements Session, VRpcSessionApi {
 
   @Override
   public Status startRpc(VRpcImpl<?, ?, ?> rpc, VirtualRpcRequest payload) {
-    // start monitoring for heartbeat when the vrpc is started
-    this.nextHeartbeat = clock.instant().plus(heartbeatInterval);
-
     synchronized (lock) {
       if (currentRpc != null) {
         return Status.INTERNAL.withDescription(
@@ -345,6 +383,14 @@ public class SessionImpl implements Session, VRpcSessionApi {
 
       this.currentRpc = rpc;
       stream.sendMessage(SessionRequest.newBuilder().setVirtualRpc(payload).build());
+      // Start monitoring for heartbeat when the vRPC is started. heartbeatInterval is read
+      // inside the lock to avoid a race with handleSessionParamsResponse(). nextHeartbeat is
+      // volatile and written here without an atomicity guarantee — that is intentional; it is
+      // only a scheduling hint (see field comment).
+      this.nextHeartbeat = clock.instant().plus(heartbeatInterval);
+      // Arm the heartbeat check only while a vRPC is in flight. handleVRpcResponse /
+      // handleVRpcErrorResponse cancel it on completion; updateState cancels on shutdown.
+      scheduleHeartbeatCheck();
       return Status.OK;
     }
   }
@@ -358,6 +404,44 @@ public class SessionImpl implements Session, VRpcSessionApi {
                 Status.CANCELLED.withDescription(message).withCause(cause));
       }
       // do nothing if the rpc is already finished
+    }
+  }
+
+  @GuardedBy("lock")
+  private void scheduleHeartbeatCheck() {
+    heartbeatTimeout =
+        timer.newTimeout(
+            this::checkHeartbeat, HEARTBEAT_CHECK_INTERVAL.toMillis(), TimeUnit.MILLISECONDS);
+  }
+
+  @GuardedBy("lock")
+  private void cancelHeartbeatTimeout() {
+    if (heartbeatTimeout != null) {
+      heartbeatTimeout.cancel();
+      heartbeatTimeout = null;
+    }
+  }
+
+  // Runs on the wheel-timer tick thread. Takes the per-session lock to read state/nextHeartbeat
+  // and force-close on miss, then chains the next tick by re-scheduling. If the session is past
+  // WAIT_SERVER_CLOSE we drop the chain — no further checks are useful.
+  private void checkHeartbeat() {
+    CloseSessionRequest missed = null;
+    synchronized (lock) {
+      if (state.phase >= SessionState.WAIT_SERVER_CLOSE.phase) {
+        return;
+      }
+      if (clock.instant().isAfter(nextHeartbeat)) {
+        missed = MISSED_HEARTBEAT_CLOSE_REQUEST;
+      } else {
+        scheduleHeartbeatCheck();
+      }
+    }
+    if (missed != null) {
+      logger.warning(
+          String.format("Missed heartbeat for %s, forcing session close", info.getLogName()));
+      // forceClose acquires the lock again and performs its own state checks.
+      forceClose(missed);
     }
   }
 
@@ -482,6 +566,8 @@ public class SessionImpl implements Session, VRpcSessionApi {
       // TODO: handle multiplexing
       currentRpc = null;
       needsClose = (state == SessionState.CLOSING);
+      // No active vRPC means no useful heartbeat deadline; drop the in-flight tick.
+      cancelHeartbeatTimeout();
     }
 
     if (localCancel != null) {
@@ -560,6 +646,8 @@ public class SessionImpl implements Session, VRpcSessionApi {
       localRpc = currentRpc;
       currentRpc = null;
       needsClose = (state == SessionState.CLOSING);
+      // No active vRPC means no useful heartbeat deadline; drop the in-flight tick.
+      cancelHeartbeatTimeout();
     }
 
     if (localCancel != null) {
@@ -681,6 +769,12 @@ public class SessionImpl implements Session, VRpcSessionApi {
   private void updateState(SessionState newState) {
     this.state = newState;
     this.lastStateChangedAt = clock.instant();
+    // Once we're past READY, no further heartbeat checks are useful: checkHeartbeat short-circuits
+    // on state.phase >= WAIT_SERVER_CLOSE. Cancel any pending tick to keep the wheel clean during
+    // session churn.
+    if (newState.phase >= SessionState.WAIT_SERVER_CLOSE.phase) {
+      cancelHeartbeatTimeout();
+    }
   }
 
   private static String formatPeerInfo(PeerInfo peerInfo) {

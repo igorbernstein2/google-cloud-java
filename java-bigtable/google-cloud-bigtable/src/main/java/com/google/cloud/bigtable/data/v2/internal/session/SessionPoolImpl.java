@@ -59,12 +59,11 @@ import java.time.Instant;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -112,6 +111,10 @@ public class SessionPoolImpl<OpenReqT extends Message> implements SessionPool<Op
 
   private final Watchdog watchdog;
 
+  // Shared by every SessionImpl, PendingVRpc, Watchdog, AFE pruner, and retry-create-session in
+  // this pool. One tick thread per Client (owned by Client); O(1) insert / O(1) cancel.
+  private final BigtableTimer timer;
+
   @GuardedBy("this")
   private int consecutiveFailures = 0;
 
@@ -122,14 +125,16 @@ public class SessionPoolImpl<OpenReqT extends Message> implements SessionPool<Op
    */
   private volatile int consecutiveUnimplementedFailures = 0;
 
-  private final ScheduledFuture<?> afeListPruneTask;
-
-  private final ScheduledFuture<?> heartbeatMonitor;
-
-  private final ScheduledExecutorService executorService;
+  // Self-rescheduling AFE-prune chain. Set by scheduleNextAfePrune; cancelled by close.
+  @GuardedBy("this")
+  @Nullable
+  private BigtableTimer.Timeout afeListPruneTimeout;
 
   @GuardedBy("this")
-  private ScheduledFuture<?> retryCreateSessionFuture = null;
+  private boolean closed = false;
+
+  @GuardedBy("this")
+  private BigtableTimer.Timeout retryCreateSessionFuture = null;
 
   // TODO: get the max from ClientConfiguration
   @GuardedBy("this")
@@ -140,6 +145,10 @@ public class SessionPoolImpl<OpenReqT extends Message> implements SessionPool<Op
 
   private final DebugTagTracer debugTagTracer;
 
+  // @SuppressWarnings("GuardedBy"): error-prone flags writes to @GuardedBy("this") fields
+  // (sessions, picker, poolSizer, pendingRpcs, budget, retryCreateSessionFuture) inside the
+  // constructor without holding the monitor. This is safe because the object is not yet published
+  // to other threads — no external reference exists until the constructor returns.
   @SuppressWarnings("GuardedBy")
   public SessionPoolImpl(
       Metrics metrics,
@@ -150,7 +159,7 @@ public class SessionPoolImpl<OpenReqT extends Message> implements SessionPool<Op
       CallOptions callOptions,
       SessionDescriptor<OpenReqT> sessionDescriptor,
       String name,
-      ScheduledExecutorService executorService) {
+      BigtableTimer timer) {
     this(
         metrics,
         featureFlags,
@@ -160,10 +169,11 @@ public class SessionPoolImpl<OpenReqT extends Message> implements SessionPool<Op
         callOptions,
         sessionDescriptor,
         name,
-        executorService,
+        timer,
         createInitialBudget(configManager.getClientConfiguration()));
   }
 
+  // @SuppressWarnings("GuardedBy"): same rationale as the public constructor above.
   @SuppressWarnings("GuardedBy")
   @VisibleForTesting
   SessionPoolImpl(
@@ -175,7 +185,7 @@ public class SessionPoolImpl<OpenReqT extends Message> implements SessionPool<Op
       CallOptions callOptions,
       SessionDescriptor<OpenReqT> sessionDescriptor,
       String name,
-      ScheduledExecutorService executorService,
+      BigtableTimer timer,
       SessionCreationBudget budget) {
     this.metrics = metrics;
     this.featureFlags = featureFlags;
@@ -183,7 +193,9 @@ public class SessionPoolImpl<OpenReqT extends Message> implements SessionPool<Op
     this.factory =
         new SessionFactory(channelPool, sessionDescriptor.getMethodDescriptor(), callOptions);
     this.descriptor = sessionDescriptor;
-    this.executorService = executorService;
+    // Timer is owned by the caller (typically Client) and shared across pools — do NOT stop it
+    // in close().
+    this.timer = timer;
 
     sessions = new SessionList();
     LoadBalancingOptions lbOptions =
@@ -205,29 +217,9 @@ public class SessionPoolImpl<OpenReqT extends Message> implements SessionPool<Op
     debugTagTracer = metrics.getDebugTagTracer();
 
     // Watchdog checks for sessions in WAIT_SERVER_CLOSE state and runs every 5 minutes
-    watchdog = new Watchdog(this, executorService, Duration.ofMinutes(5), sessions, debugTagTracer);
-    // Heartbeat monitor checks for sessions in READY state with active vRPCs and runs more
-    // frequently
-    heartbeatMonitor =
-        executorService.scheduleAtFixedRate(
-            () -> {
-              synchronized (SessionPoolImpl.this) {
-                sessions.checkHeartbeat(Clock.systemUTC());
-              }
-            },
-            SessionImpl.HEARTBEAT_CHECK_INTERVAL.toMillis(),
-            SessionImpl.HEARTBEAT_CHECK_INTERVAL.toMillis(),
-            TimeUnit.MILLISECONDS);
-    afeListPruneTask =
-        executorService.scheduleAtFixedRate(
-            () -> {
-              synchronized (SessionPoolImpl.this) {
-                sessions.prune();
-              }
-            },
-            SessionList.SESSION_LIST_PRUNE_INTERVAL.toMillis(),
-            SessionList.SESSION_LIST_PRUNE_INTERVAL.toMillis(),
-            TimeUnit.MILLISECONDS);
+    watchdog = new Watchdog(this, timer, Duration.ofMinutes(5), sessions, debugTagTracer);
+    // Heartbeat monitoring is now done per-session via SessionImpl.scheduleHeartbeatCheck.
+    scheduleNextAfePrune();
 
     this.budget = budget;
 
@@ -261,18 +253,53 @@ public class SessionPoolImpl<OpenReqT extends Message> implements SessionPool<Op
       logger.fine(String.format("Closing session pool %s for reason %s", info.getLogName(), req));
 
       poolState = PoolState.CLOSED;
+      closed = true;
 
       for (PendingVRpc<?, ?> pendingRpc : pendingRpcs) {
         pendingRpc.cancel("SessionPool closed: " + req, null);
       }
-      afeListPruneTask.cancel(false);
-      heartbeatMonitor.cancel(false);
+      if (afeListPruneTimeout != null) {
+        afeListPruneTimeout.cancel();
+        afeListPruneTimeout = null;
+      }
       if (retryCreateSessionFuture != null) {
-        retryCreateSessionFuture.cancel(false);
+        retryCreateSessionFuture.cancel();
         retryCreateSessionFuture = null;
       }
       watchdog.close();
       sessions.close(req);
+    }
+
+    // Timer is owned by the Client and shared across pools; do not stop it here.
+  }
+
+  // Self-rescheduling AFE prune. Pattern matches Watchdog: tick dispatches to the pool executor,
+  // executor takes the lock, prunes, schedules the next tick. Tolerates body exceptions so a
+  // transient fault does not permanently disable pruning.
+  @GuardedBy("this")
+  private void scheduleNextAfePrune() {
+    if (closed) {
+      return;
+    }
+    afeListPruneTimeout =
+        timer.newTimeout(
+            this::runAfePruneAndReschedule,
+            SessionList.SESSION_LIST_PRUNE_INTERVAL.toMillis(),
+            TimeUnit.MILLISECONDS);
+  }
+
+  private void runAfePruneAndReschedule() {
+    synchronized (SessionPoolImpl.this) {
+      try {
+        if (closed) {
+          return;
+        }
+        sessions.prune();
+      } catch (Throwable t) {
+        logger.log(Level.WARNING, "AFE prune tick threw; continuing", t);
+      } finally {
+        scheduleNextAfePrune();
+      }
     }
   }
 
@@ -345,7 +372,7 @@ public class SessionPoolImpl<OpenReqT extends Message> implements SessionPool<Op
       try (Scope ignored = io.opentelemetry.context.Context.root().makeCurrent()) {
 
         SessionStream stream = factory.createNew();
-        Session session = new SessionImpl(metrics, info, sessionNum++, stream);
+        Session session = new SessionImpl(metrics, info, sessionNum++, stream, timer);
         SessionHandle handle = sessions.newHandle(session);
 
         Metadata localMd = new Metadata();
@@ -388,9 +415,9 @@ public class SessionPoolImpl<OpenReqT extends Message> implements SessionPool<Op
       retryIntervalMs = 1;
     }
     retryCreateSessionFuture =
-        executorService.schedule(
+        timer.newTimeout(
             () -> {
-              synchronized (this) {
+              synchronized (SessionPoolImpl.this) {
                 retryCreateSessionFuture = null;
                 if (poolState != PoolState.CLOSED && poolSizer.getScaleDelta() > 0) {
                   createSession(openParams);
@@ -515,9 +542,18 @@ public class SessionPoolImpl<OpenReqT extends Message> implements SessionPool<Op
                           status, trailers)));
       for (PendingVRpc<?, ?> vrpc : toBeClosed) {
         try {
-          vrpc.getListener().onClose(result);
+          vrpc.ctx
+              .getExecutor()
+              .execute(
+                  () -> {
+                    try {
+                      vrpc.getListener().onClose(result);
+                    } catch (Throwable t) {
+                      logger.log(Level.WARNING, "Exception when closing request", t);
+                    }
+                  });
         } catch (Throwable t) {
-          logger.log(Level.WARNING, "Exception when closing request", t);
+          logger.log(Level.WARNING, "Exception dispatching close to op executor", t);
         }
       }
     }
@@ -615,7 +651,7 @@ public class SessionPoolImpl<OpenReqT extends Message> implements SessionPool<Op
     private boolean isCancelled = false;
     private VRpc<ReqT, RespT> realCall;
 
-    private ScheduledFuture<?> deadlineMonitor;
+    private BigtableTimer.Timeout deadlineMonitor;
 
     public PendingVRpc(VRpcDescriptor<?, ReqT, RespT> desc) {
       this.desc = desc;
@@ -631,14 +667,14 @@ public class SessionPoolImpl<OpenReqT extends Message> implements SessionPool<Op
       this.req = req;
       this.ctx = ctx;
       this.listener = listener;
-      this.deadlineMonitor = monitorDeadline(executorService, ctx.getOperationInfo().getDeadline());
+      this.deadlineMonitor = monitorDeadline(ctx.getOperationInfo().getDeadline());
 
       synchronized (SessionPoolImpl.this) {
         if (SessionPoolImpl.this.poolState != PoolState.STARTED) {
-          listener.onClose(
+          VRpcResult result =
               VRpcResult.createUncommitedError(
-                  Status.UNAVAILABLE.withCause(
-                      new IllegalStateException("SessionPool is closed"))));
+                  Status.UNAVAILABLE.withCause(new IllegalStateException("SessionPool is closed")));
+          ctx.getExecutor().execute(() -> listener.onClose(result));
           return;
         }
         pendingRpcs.add(this);
@@ -697,7 +733,8 @@ public class SessionPoolImpl<OpenReqT extends Message> implements SessionPool<Op
       if (delegateToRealCall) {
         realCall.cancel(status.getDescription(), status.getCause());
       } else {
-        listener.onClose(VRpcResult.createRejectedError(status));
+        VRpcResult result = VRpcResult.createRejectedError(status);
+        ctx.getExecutor().execute(() -> listener.onClose(result));
       }
     }
 
@@ -718,7 +755,7 @@ public class SessionPoolImpl<OpenReqT extends Message> implements SessionPool<Op
       }
       this.realCall.start(req, ctx, listener);
       if (deadlineMonitor != null) {
-        deadlineMonitor.cancel(false);
+        deadlineMonitor.cancel();
       }
     }
 
@@ -726,12 +763,12 @@ public class SessionPoolImpl<OpenReqT extends Message> implements SessionPool<Op
       return listener;
     }
 
-    private ScheduledFuture<?> monitorDeadline(
-        ScheduledExecutorService executorService, Deadline deadline) {
-      return executorService.schedule(
+    private BigtableTimer.Timeout monitorDeadline(Deadline deadline) {
+      // Body runs on the timer's bundled dispatcher (off the tick thread).
+      // onlyCancelPendingCall=true avoids racing with a user cancel that already attached a real
+      // call.
+      return timer.newTimeout(
           () ->
-              // This could race with user cancel. Setting onlyCancelPendingCall to true
-              // so that if the real call is set, this cancellation is going to be a noop.
               cancel(
                   Status.DEADLINE_EXCEEDED.withDescription("Deadline exceeded waiting for session"),
                   true),
@@ -744,33 +781,45 @@ public class SessionPoolImpl<OpenReqT extends Message> implements SessionPool<Op
     private static final Logger LOG = Logger.getLogger(Watchdog.class.getName());
 
     private final Object lock;
-    private final ScheduledExecutorService executor;
+    private final BigtableTimer timer;
     private final Duration interval;
     private final SessionList sessions;
-    private ScheduledFuture<?> future;
     private final Clock clock;
     private final DebugTagTracer debugTagTracer;
 
-    // TODO: fix lock sharing
+    // Guards currentTimeout and watchdogClosed. Self-contained — never composed with any external
+    // lock.
+    private final Object scheduleLock = new Object();
+
+    @GuardedBy("scheduleLock")
+    private BigtableTimer.Timeout currentTimeout;
+
+    @GuardedBy("scheduleLock")
+    private boolean watchdogClosed = false;
+
+    // The `lock` parameter is the pool-wide monitor (SessionPoolImpl.this). It is typed as Object
+    // because Watchdog is a static nested class and cannot reference the outer instance type in its
+    // constructor signature without creating a circular dependency. Phase 5 will replace this with
+    // a properly typed lock once the per-AFE sharding model is established.
     public Watchdog(
         Object lock,
-        ScheduledExecutorService executor,
+        BigtableTimer timer,
         Duration interval,
         SessionList sessionList,
         DebugTagTracer debugTagTracer) {
-      this(lock, executor, interval, sessionList, debugTagTracer, Clock.systemUTC());
+      this(lock, timer, interval, sessionList, debugTagTracer, Clock.systemUTC());
     }
 
     @VisibleForTesting
     Watchdog(
         Object lock,
-        ScheduledExecutorService executor,
+        BigtableTimer timer,
         Duration interval,
         SessionList sessionList,
         DebugTagTracer debugTagTracer,
         Clock clock) {
       this.lock = lock;
-      this.executor = executor;
+      this.timer = timer;
       this.interval = interval;
       this.sessions = sessionList;
       this.debugTagTracer = debugTagTracer;
@@ -778,16 +827,40 @@ public class SessionPoolImpl<OpenReqT extends Message> implements SessionPool<Op
     }
 
     public void start() {
-      future =
-          executor.scheduleAtFixedRate(
-              this, interval.toMillis(), interval.toMillis(), TimeUnit.MILLISECONDS);
+      scheduleNext();
+    }
+
+    // Self-reschedule. Called once from start() and again at the end of each tick.
+    private void scheduleNext() {
+      synchronized (scheduleLock) {
+        if (watchdogClosed) return;
+        currentTimeout =
+            timer.newTimeout(this::runAndReschedule, interval.toMillis(), TimeUnit.MILLISECONDS);
+      }
+    }
+
+    private void runAndReschedule() {
+      try {
+        run();
+      } catch (Throwable t) {
+        // Preserve the watchdog across body exceptions — unlike scheduleAtFixedRate, which silently
+        // stops the schedule on the first exception, we keep going so a transient fault doesn't
+        // permanently disable session leak detection.
+        LOG.log(Level.WARNING, "Watchdog tick threw; continuing", t);
+      } finally {
+        scheduleNext();
+      }
     }
 
     @Override
     public void run() {
+      // Snapshot under the pool lock: getAllSessions() returns the live HashSet, and pool state
+      // mutation (session create/close on another thread) during iteration would throw
+      // ConcurrentModificationException. Most common trigger is a heartbeat-miss cascade that
+      // churns sessions while the watchdog is walking the list.
       Set<SessionHandle> allSessions;
       synchronized (lock) {
-        allSessions = sessions.getAllSessions();
+        allSessions = new HashSet<>(sessions.getAllSessions());
       }
 
       for (SessionHandle handle : allSessions) {
@@ -825,8 +898,12 @@ public class SessionPoolImpl<OpenReqT extends Message> implements SessionPool<Op
     }
 
     public void close() {
-      if (future != null) {
-        future.cancel(false);
+      synchronized (scheduleLock) {
+        watchdogClosed = true;
+        if (currentTimeout != null) {
+          currentTimeout.cancel();
+          currentTimeout = null;
+        }
       }
     }
   }
