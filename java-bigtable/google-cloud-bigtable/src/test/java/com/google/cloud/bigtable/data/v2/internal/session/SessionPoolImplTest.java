@@ -73,6 +73,7 @@ import io.grpc.Server;
 import io.grpc.ServerCall;
 import io.grpc.ServerCallHandler;
 import io.grpc.ServerInterceptor;
+import io.grpc.Status;
 import java.io.IOException;
 import java.time.Duration;
 import java.time.Instant;
@@ -99,7 +100,6 @@ import org.mockito.Mockito;
 import org.mockito.junit.jupiter.MockitoExtension;
 
 @Timeout(30)
-@Nested
 @ExtendWith(MockitoExtension.class)
 public class SessionPoolImplTest {
   private static final ClientInfo CLIENT_INFO =
@@ -170,12 +170,15 @@ public class SessionPoolImplTest {
   }
 
   @AfterEach
-  void tearDown() {
+  void tearDown() throws InterruptedException {
     sessionPool.close(
         CloseSessionRequest.newBuilder()
             .setReason(CloseSessionRequest.CloseSessionReason.CLOSE_SESSION_REASON_USER)
             .setDescription("close session")
             .build());
+    // Wait for sessions to drain so the watchdog can be closed before testTimer.stop() races
+    // with its self-reschedule loop.
+    sessionPool.awaitTerminated(Duration.ofSeconds(10));
     channelPool.close();
     // channel gets shutdown in channelPool.close()
     server.shutdownNow();
@@ -273,6 +276,126 @@ public class SessionPoolImplTest {
       VRpcResult result = resultFuture.get(1, TimeUnit.MINUTES);
       assertThat(result).isOk();
 
+    } finally {
+      if (testSessionPool != null) {
+        testSessionPool.close(CloseSessionRequest.getDefaultInstance());
+      }
+    }
+  }
+
+  @Test
+  void awaitTerminatedReturnsTrueWhenPoolIsEmpty() throws InterruptedException {
+    // A pool that was never started has no sessions; close() should complete drainedFuture
+    // immediately and awaitTerminated should return true without blocking.
+    sessionPool.close(
+        CloseSessionRequest.newBuilder()
+            .setReason(CloseSessionRequest.CloseSessionReason.CLOSE_SESSION_REASON_USER)
+            .setDescription("empty pool")
+            .build());
+    assertThat(sessionPool.awaitTerminated(Duration.ofMillis(100))).isTrue();
+  }
+
+  @Test
+  void awaitTerminatedReturnsTrueAfterSessionsDrain()
+      throws InterruptedException, ExecutionException, TimeoutException {
+    // Start a real session, issue + complete a vRPC so the session is fully open, then close
+    // the pool and verify awaitTerminated returns true (sessions cleanly drained).
+    sessionPool.start(OpenFakeSessionRequest.getDefaultInstance(), new Metadata());
+
+    VRpc<SessionFakeScriptedRequest, SessionFakeScriptedResponse> vrpc =
+        sessionPool.newCall(FakeDescriptor.SCRIPTED);
+    UnaryResponseFuture<SessionFakeScriptedResponse> resultFuture = new UnaryResponseFuture<>();
+    vrpc.start(
+        SessionFakeScriptedRequest.getDefaultInstance(),
+        VRpcCallContext.create(Deadline.after(10, TimeUnit.SECONDS), true, vrpcTracer),
+        resultFuture);
+    resultFuture.get(10, TimeUnit.SECONDS);
+
+    sessionPool.close(
+        CloseSessionRequest.newBuilder()
+            .setReason(CloseSessionRequest.CloseSessionReason.CLOSE_SESSION_REASON_USER)
+            .setDescription("after drain")
+            .build());
+
+    assertThat(sessionPool.awaitTerminated(Duration.ofSeconds(10))).isTrue();
+  }
+
+  @Test
+  void closeCancelsInFlightVRpcAndDrains() throws InterruptedException {
+    // Park the session-open response in the client interceptor so the vRPC cannot drain to a
+    // ready session and sits in pendingRpcs. Then close the pool and verify (a) the queued
+    // vRPC's listener gets a CANCELLED onClose with the "SessionPool closed:" description from
+    // SessionPoolImpl.close()'s cancellation loop, (b) awaitTerminated returns true (the
+    // OPENING session is driven to CLOSED by sessions.close(req), not parked until the
+    // watchdog tick), and (c) no second onClose arrives once the delayed responses finally
+    // flush past the interceptor.
+    SessionPool<OpenFakeSessionRequest> testSessionPool = null;
+    try (ChannelPool delayedPool =
+        new SingleChannelPool(
+            Suppliers.ofInstance(
+                Grpc.newChannelBuilderForAddress(
+                        "localhost", server.getPort(), InsecureChannelCredentials.create())
+                    .intercept(new DelayedClientInterceptor(Duration.ofMillis(100)))
+                    .build()))) {
+
+      delayedPool.start();
+
+      testSessionPool =
+          new SessionPoolImpl<>(
+              metrics,
+              FeatureFlags.getDefaultInstance(),
+              CLIENT_INFO,
+              configManager,
+              delayedPool,
+              CallOptions.DEFAULT,
+              FakeDescriptor.FAKE_SESSION,
+              "fake-pool-in-flight",
+              testTimer);
+
+      testSessionPool.start(OpenFakeSessionRequest.getDefaultInstance(), new Metadata());
+
+      VRpc<SessionFakeScriptedRequest, SessionFakeScriptedResponse> vrpc =
+          testSessionPool.newCall(FakeDescriptor.SCRIPTED);
+      CopyOnWriteArrayList<VRpcResult> closes = new CopyOnWriteArrayList<>();
+      CountDownLatch firstClose = new CountDownLatch(1);
+      Duration deadline = Duration.ofSeconds(10);
+      vrpc.start(
+          SessionFakeScriptedRequest.getDefaultInstance(),
+          VRpcCallContext.create(
+              Deadline.after(deadline.toMillis(), TimeUnit.MILLISECONDS), true, vrpcTracer),
+          new VRpc.VRpcListener<SessionFakeScriptedResponse>() {
+            @Override
+            public void onMessage(SessionFakeScriptedResponse msg) {}
+
+            @Override
+            public void onClose(VRpcResult result) {
+              closes.add(result);
+              firstClose.countDown();
+            }
+          });
+
+      // vRPC is now queued in pendingRpcs behind the parked session-open. Close the pool.
+      testSessionPool.close(
+          CloseSessionRequest.newBuilder()
+              .setReason(CloseSessionRequest.CloseSessionReason.CLOSE_SESSION_REASON_USER)
+              .setDescription("close while in flight")
+              .build());
+
+      // Cancellation hops through the vRPC's per-op SerializingExecutor — not the gRPC
+      // listener thread — so it should arrive promptly even while the interceptor is asleep.
+      assertThat(firstClose.await(2, TimeUnit.SECONDS)).isTrue();
+      assertThat(closes).hasSize(1);
+      VRpcResult result = closes.get(0);
+      assertThat(result).status().code().isEqualTo(Status.Code.CANCELLED);
+      assertThat(result).status().description().contains("SessionPool closed:");
+
+      // OPENING session drains via sessions.close(req) once the delayed onMessages flush.
+      assertThat(testSessionPool.awaitTerminated(Duration.ofSeconds(10))).isTrue();
+
+      // Regression guard: the delayed session-open responses arriving post-cancellation must
+      // not produce a phantom second onClose on the cancelled vRPC's listener.
+      Thread.sleep(200);
+      assertThat(closes).hasSize(1);
     } finally {
       if (testSessionPool != null) {
         testSessionPool.close(CloseSessionRequest.getDefaultInstance());
